@@ -22,5 +22,166 @@ def sec_to_hms(sec):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def format_srt_time(seconds):
-    hrs, rem = divmod(seconds, 36
-                      
+    hrs, rem = divmod(seconds, 3600)
+    mins, secs = divmod(rem, 60)
+    ms = int((secs - int(secs)) * 1000)
+    return f"{int(hrs):02d}:{int(mins):02d}:{int(secs):02d},{ms:03d}"
+
+def fetch_transcript_safe(vid_id):
+    try:
+        ytt = YouTubeTranscriptApi()
+        fetched = ytt.fetch(vid_id, languages=['hi', 'en', 'en-IN'])
+        return [{"start": s.start, "duration": s.duration, "text": s.text} for s in fetched]
+    except Exception:
+        try:
+            return YouTubeTranscriptApi.get_transcript(vid_id, languages=['hi', 'en', 'en-IN'])
+        except Exception:
+            return []
+
+def generate_clips(youtube_url, api_key, facecam_pos, num_clips, cookies_file):
+    if not youtube_url or not api_key:
+        return "❌ कृपया YouTube लिंक और अपनी Gemini API Key दोनों डालें।", None, ""
+
+    vid_id = get_video_id(youtube_url)
+    if not vid_id:
+        return "❌ सही YouTube वीडियो या लाइव स्ट्रीम लिंक डालें।", None, ""
+
+    os.makedirs("outputs", exist_ok=True)
+    for f in os.listdir("outputs"):
+        os.remove(os.path.join("outputs", f))
+
+    transcript_list = fetch_transcript_safe(vid_id)
+    moments = []
+
+    if transcript_list:
+        try:
+            condensed = []
+            step = max(1, len(transcript_list) // 400)
+            for i in range(0, len(transcript_list), step):
+                item = transcript_list[i]
+                condensed.append(f"[{int(item['start'])}s] {item['text']}")
+            transcript_text = "\n".join(condensed[:400])
+
+            client = genai.Client(api_key=api_key.strip())
+            prompt = f"""
+            Analyze this gaming stream transcript and find the top {int(num_clips)} funniest, high-energy, or viral moments suitable for 40-second YouTube Shorts.
+            Return ONLY a valid JSON array with exact format:
+            [
+              {{"start_sec": 120, "title": "Catchy Short Title #GTA6 #Shorts", "caption": "Viral description with hashtags"}}
+            ]
+            Transcript:
+            {transcript_text}
+            """
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+            raw_json = response.text.strip().replace("```json", "").replace("```", "").strip()
+            moments = json.loads(raw_json)[:int(num_clips)]
+        except Exception:
+            moments = []
+
+    if not moments:
+        for i in range(int(num_clips)):
+            moments.append({
+                "start_sec": 180 + (i * 480),
+                "title": f"GTA Epic Gameplay Moment #{i+1} 🔥 #GTA6 #Shorts",
+                "caption": f"Crazy GTA Gaming Highlight #{i+1}! 😱🎮\n\n#GTA6 #GTAVI #GamingShorts #YouTubeShorts #Viral"
+            })
+
+    crop_map = {
+        "top-left": "crop=360:240:0:0",
+        "top-right": "crop=360:240:920:0",
+        "bottom-left": "crop=360:240:0:480",
+        "bottom-right": "crop=360:240:920:480"
+    }
+    cam_crop = crop_map.get(facecam_pos, "crop=360:240:0:480")
+    cookie_arg = f'--cookies "{cookies_file.name}"' if cookies_file else ""
+
+    generated_files = []
+    all_captions = []
+    last_error = ""
+
+    for idx, m in enumerate(moments, 1):
+        start_s = int(m.get("start_sec", 0))
+        end_s = start_s + 40
+        start_hms = sec_to_hms(start_s)
+        end_hms = sec_to_hms(end_s)
+
+        raw_vid = f"outputs/raw_{idx}.mp4"
+        final_vid = f"outputs/Auclipto_Short_{idx}.mp4"
+        srt_file = f"outputs/sub_{idx}.srt"
+
+        clip_subs = [t for t in transcript_list if start_s <= t['start'] <= end_s]
+        has_subs = len(clip_subs) > 0
+
+        if has_subs:
+            with open(srt_file, "w", encoding="utf-8") as sf:
+                for s_i, sub in enumerate(clip_subs, 1):
+                    rel_start = max(0, sub['start'] - start_s)
+                    rel_end = min(40, rel_start + sub['duration'])
+                    sf.write(f"{s_i}\n{format_srt_time(rel_start)} --> {format_srt_time(rel_end)}\n{sub['text']}\n\n")
+
+        dl_cmd = (
+            f'yt-dlp --no-check-certificates --force-ipv4 '
+            f'--extractor-args "youtube:player_client=tv,web" --js-runtimes node '
+            f'{cookie_arg} --download-sections "*{start_hms}-{end_hms}" '
+            f'-f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best" '
+            f'"{youtube_url}" -o "{raw_vid}"'
+        )
+        res = subprocess.run(dl_cmd, shell=True, capture_output=True, text=True)
+        if res.returncode != 0:
+            last_error = res.stderr[-300:]
+
+        if os.path.exists(raw_vid):
+            if has_subs:
+                filter_complex = (
+                    f"[0:v]{cam_crop},scale=1080:640[cam];"
+                    f"[0:v]crop=608:720:336:0,scale=1080:1280[game];"
+                    f"[cam][game]vstack=inputs=2[stacked];"
+                    f"[stacked]subtitles={srt_file}:force_style='Fontname=Arial,FontSize=18,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=80'[out]"
+                )
+            else:
+                filter_complex = (
+                    f"[0:v]{cam_crop},scale=1080:640[cam];"
+                    f"[0:v]crop=608:720:336:0,scale=1080:1280[game];"
+                    f"[cam][game]vstack=inputs=2[out]"
+                )
+
+            ff_cmd = f'ffmpeg -y -i "{raw_vid}" -filter_complex "{filter_complex}" -map "[out]" -map 0:a -c:v libx264 -preset ultrafast -crf 24 -c:a aac "{final_vid}"'
+            ff_res = subprocess.run(ff_cmd, shell=True, capture_output=True, text=True)
+            if ff_res.returncode != 0:
+                last_error = ff_res.stderr[-300:]
+
+            if os.path.exists(final_vid):
+                generated_files.append(final_vid)
+                all_captions.append(f"=== CLIP {idx} ===\nTitle: {m.get('title')}\nCaption: {m.get('caption')}\n")
+
+    if not generated_files:
+        return f"❌ डाउनलोड एरर डिटेल:\n{last_error}", None, ""
+
+    zip_path = "outputs/Auclipto_All_Shorts.zip"
+    with zipfile.ZipFile(zip_path, 'w') as zf:
+        for file in generated_files:
+            zf.write(file, os.path.basename(file))
+
+    return f"✅ सफलता! कुल {len(generated_files)} वायरल Shorts (720p, बिना वॉटरमार्क) तैयार हैं!", zip_path, "\n".join(all_captions)
+
+with gr.Blocks(theme=gr.themes.Soft(), title="Auclipto.ai") as demo:
+    gr.Markdown("# 🎬 Auclipto.ai — AI Gaming Auto-Clipper (720p No Watermark)")
+    with gr.Row():
+        url_in = gr.Textbox(label="YouTube वीडियो या Live Stream लिंक")
+        key_in = gr.Textbox(label="Gemini API Key", type="password")
+    with gr.Row():
+        cam_in = gr.Dropdown(["bottom-left", "top-left", "top-right", "bottom-right"], value="bottom-left", label="Streamer Facecam कहाँ है?")
+        num_in = gr.Slider(1, 10, value=10, step=1, label="कितनी क्लिप्स चाहिए?")
+        cookie_in = gr.File(label="cookies.txt अपलोड करें (वैकल्पिक/YouTube ब्लॉक से बचने के लिए)")
+    btn = gr.Button("🚀 वायरल क्लिप्स जनरेट करें", variant="primary")
+    status_out = gr.Textbox(label="स्टेटस")
+    zip_out = gr.File(label="📥 सभी Shorts डाउनलोड करें (ZIP फ़ाइल - 720p)")
+    cap_out = gr.Textbox(label="📝 सभी क्लिप्स के YouTube Titles और Captions", lines=12)
+
+    btn.click(generate_clips, inputs=[url_in, key_in, cam_in, num_in, cookie_in], outputs=[status_out, zip_out, cap_out])
+
+demo.launch(server_name="0.0.0.0", server_port=7860)
+            
