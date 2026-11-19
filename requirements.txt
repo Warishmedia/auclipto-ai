@@ -1,5 +1,5 @@
 gradio
-yt-dlp
+yt-dlp[default]
 youtube-transcript-api
 google-genai
 ffmpeg-python
