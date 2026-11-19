@@ -28,7 +28,6 @@ def format_srt_time(seconds):
     return f"{int(hrs):02d}:{int(mins):02d}:{int(secs):02d},{ms:03d}"
 
 def fetch_transcript_safe(vid_id):
-    # नए और पुराने दोनों वर्जन के साथ काम करने वाला तरीका
     try:
         ytt = YouTubeTranscriptApi()
         fetched = ytt.fetch(vid_id, languages=['hi', 'en', 'en-IN'])
@@ -82,7 +81,6 @@ def generate_clips(youtube_url, api_key, facecam_pos, num_clips, cookies_file):
         except Exception:
             moments = []
 
-    # अगर वीडियो में CC/Subtitles नहीं हैं तो हर 8 मिनट के अंतराल पर बेस्ट हिस्से चुनना
     if not moments:
         for i in range(int(num_clips)):
             moments.append({
@@ -102,6 +100,7 @@ def generate_clips(youtube_url, api_key, facecam_pos, num_clips, cookies_file):
 
     generated_files = []
     all_captions = []
+    last_error = ""
 
     for idx, m in enumerate(moments, 1):
         start_s = int(m.get("start_sec", 0))
@@ -123,8 +122,17 @@ def generate_clips(youtube_url, api_key, facecam_pos, num_clips, cookies_file):
                     rel_end = min(40, rel_start + sub['duration'])
                     sf.write(f"{s_i}\n{format_srt_time(rel_start)} --> {format_srt_time(rel_end)}\n{sub['text']}\n\n")
 
-        dl_cmd = f'yt-dlp {cookie_arg} --download-sections "*{start_hms}-{end_hms}" -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]" "{youtube_url}" -o "{raw_vid}"'
-        subprocess.run(dl_cmd, shell=True)
+        # Android/TV Client और JS Runtime बाईपास के साथ डाउनलोड
+        dl_cmd = (
+            f'yt-dlp --no-check-certificates --force-ipv4 '
+            f'--extractor-args "youtube:player_client=android,web" '
+            f'{cookie_arg} --download-sections "*{start_hms}-{end_hms}" '
+            f'-f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best" '
+            f'"{youtube_url}" -o "{raw_vid}"'
+        )
+        res = subprocess.run(dl_cmd, shell=True, capture_output=True, text=True)
+        if res.returncode != 0:
+            last_error = res.stderr[-300:]
 
         if os.path.exists(raw_vid):
             if has_subs:
@@ -142,14 +150,16 @@ def generate_clips(youtube_url, api_key, facecam_pos, num_clips, cookies_file):
                 )
 
             ff_cmd = f'ffmpeg -y -i "{raw_vid}" -filter_complex "{filter_complex}" -map "[out]" -map 0:a -c:v libx264 -preset ultrafast -crf 24 -c:a aac "{final_vid}"'
-            subprocess.run(ff_cmd, shell=True)
+            ff_res = subprocess.run(ff_cmd, shell=True, capture_output=True, text=True)
+            if ff_res.returncode != 0:
+                last_error = ff_res.stderr[-300:]
 
             if os.path.exists(final_vid):
                 generated_files.append(final_vid)
                 all_captions.append(f"=== CLIP {idx} ===\nTitle: {m.get('title')}\nCaption: {m.get('caption')}\n")
 
     if not generated_files:
-        return "❌ वीडियो डाउनलोड नहीं हो पाया। कृपया cookies.txt फ़ाइल अपलोड करके दोबारा कोशिश करें।", None, ""
+        return f"❌ डाउनलोड एरर डिटेल:\n{last_error}", None, ""
 
     zip_path = "outputs/Auclipto_All_Shorts.zip"
     with zipfile.ZipFile(zip_path, 'w') as zf:
@@ -175,4 +185,3 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Auclipto.ai") as demo:
     btn.click(generate_clips, inputs=[url_in, key_in, cam_in, num_in, cookie_in], outputs=[status_out, zip_out, cap_out])
 
 demo.launch(server_name="0.0.0.0", server_port=7860)
-            
