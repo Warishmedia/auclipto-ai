@@ -60,10 +60,11 @@ def fetch_transcript_safe(vid_id):
         except Exception:
             return []
 
-def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_sec=None):
+def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_sec=None, scan_hours=3):
     client = genai.Client(api_key=api_key.strip())
     limit_note = f"All start_sec values MUST be less than {int(max_sec)} seconds." if max_sec else ""
 
+    # तरीका 1: अगर ट्रांसक्रिप्ट उपलब्ध है तो तेज़ टेक्स्ट विश्लेषण
     if transcript_list:
         condensed = []
         valid_items = [t for t in transcript_list if (max_sec is None or t['start'] < max_sec)]
@@ -89,24 +90,55 @@ def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_se
             )
             return json.loads(response.text.strip())[:int(num_clips)]
 
+    # तरीका 2 (Multimodal Low-Res Chunked Video): बिना CC के बड़े वीडियो/स्ट्रीम को हिस्सों में स्कैन करना
     clean_url = clean_youtube_url(youtube_url)
-    prompt = f"""
-    Watch and listen to this YouTube video carefully and find the top {int(num_clips)} funniest, high-energy, shocking, or viral moments suitable for 35-second YouTube Shorts.
-    {limit_note}
-    Use clean Romanized Hinglish or English for titles and captions.
-    Return ONLY a JSON array of objects with exact keys: "start_sec" (integer seconds from start of video), "reason" (short reason why it is viral), "title" (catchy Short title with hashtags), "caption" (engaging description with hashtags).
-    """
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=[
-            types.Part.from_uri(file_uri=clean_url, mime_type="video/*"),
-            prompt
-        ],
-        config=types.GenerateContentConfig(response_mime_type="application/json")
-    )
-    return json.loads(response.text.strip())[:int(num_clips)]
+    chunk_sec = 7200  # एक बार में 2 घंटे (Low resolution में आसानी से 1M tokens के अंदर आता है)
+    total_scan_sec = int(scan_hours * 3600)
+    if max_sec:
+        total_scan_sec = min(total_scan_sec, int(max_sec))
 
-def find_stream_timestamps(youtube_url, api_key, num_clips):
+    all_moments = []
+    chunks = max(1, (total_scan_sec + chunk_sec - 1) // chunk_sec)
+    per_chunk_clips = max(2, (int(num_clips) + chunks - 1) // chunks)
+
+    for c_idx in range(chunks):
+        c_start = c_idx * chunk_sec
+        c_end = min((c_idx + 1) * chunk_sec, total_scan_sec)
+        if c_start >= c_end:
+            break
+
+        prompt = f"""
+        Watch and listen to this segment of the YouTube video (from {c_start}s to {c_end}s) and find the top {per_chunk_clips} funniest, high-energy, shocking, or viral moments suitable for 35-second YouTube Shorts.
+        IMPORTANT: "start_sec" MUST be the exact timestamp in seconds from the VERY BEGINNING (0s) of the full video (between {c_start} and {c_end}).
+        {limit_note}
+        Use clean Romanized Hinglish or English for titles and captions.
+        Return ONLY a JSON array of objects with exact keys: "start_sec" (integer), "reason" (short reason), "title" (catchy Short title with hashtags), "caption" (engaging description with hashtags).
+        """
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=[
+                    types.Part(
+                        file_data=types.FileData(file_uri=clean_url, mime_type="video/*"),
+                        video_metadata=types.VideoMetadata(start_offset=f"{c_start}s", end_offset=f"{c_end}s")
+                    ),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    media_resolution="MEDIA_RESOLUTION_LOW"
+                )
+            )
+            chunk_moments = json.loads(response.text.strip())
+            all_moments.extend(chunk_moments)
+        except Exception as e:
+            if c_idx == 0:
+                raise e
+            break
+
+    return all_moments[:int(num_clips)]
+
+def find_stream_timestamps(youtube_url, api_key, num_clips, scan_hours):
     if not youtube_url or not api_key:
         return "❌ कृपया YouTube वीडियो/लाइव स्ट्रीम लिंक और अपनी Gemini API Key दोनों डालें।"
     vid_id = get_video_id(youtube_url)
@@ -115,8 +147,8 @@ def find_stream_timestamps(youtube_url, api_key, num_clips):
 
     try:
         transcript_list = fetch_transcript_safe(vid_id)
-        mode_used = "Transcript + AI" if transcript_list else "Direct Gemini Multimodal Video AI (बिना CC के)"
-        moments = analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips)
+        mode_used = "Transcript + AI" if transcript_list else f"Direct Gemini Multimodal AI (0 से {int(scan_hours)} घंटे स्कैन)"
+        moments = analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, scan_hours=scan_hours)
 
         if not moments:
             return "❌ AI कोई वायरल मोमेंट नहीं निकाल पाया।"
@@ -275,14 +307,17 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Auclipto.ai 2.0") as demo:
             )
 
         with gr.Tab("🔍 2. 12-Hour Stream Timestamp Finder (बिना डाउनलोड)"):
-            gr.Markdown("### किसी भी YouTube वीडियो या लाइव स्ट्रीम का लिंक डालें — Gemini AI बिना CC के भी वीडियो सुनकर-देखकर वायरल टाइमस्टैम्प बता देगा!")
+            gr.Markdown("### किसी भी YouTube वीडियो या 12-15 घंटे की लाइव स्ट्रीम का लिंक डालें — AI हिस्सों में स्कैन करके टॉप वायरल टाइमस्टैम्प बता देगा!")
             with gr.Row():
                 ts_url_in = gr.Textbox(label="🔗 YouTube Live Stream / Video लिंक")
                 ts_key_in = gr.Textbox(label="🔑 Gemini API Key", type="password")
+            with gr.Row():
                 ts_num_in = gr.Slider(3, 15, value=10, step=1, label="🎯 कितने वायरल टाइमस्टैम्प चाहिए?")
+                ts_hours_in = gr.Slider(1, 15, value=4, step=1, label="⏱️ स्ट्रीम के शुरुआती कितने घंटे स्कैन करें?")
             ts_btn = gr.Button("🔍 वायरल टाइमस्टैम्प ढूँढें", variant="primary")
             ts_out = gr.Textbox(label="📋 टॉप वायरल टाइमस्टैम्प लिस्ट (घंटा:मिनट:सेकंड)", lines=16)
 
-            ts_btn.click(find_stream_timestamps, inputs=[ts_url_in, ts_key_in, ts_num_in], outputs=[ts_out])
+            ts_btn.click(find_stream_timestamps, inputs=[ts_url_in, ts_key_in, ts_num_in, ts_hours_in], outputs=[ts_out])
 
 demo.launch(server_name="0.0.0.0", server_port=7860)
+    
