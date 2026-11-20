@@ -1,4 +1,4 @@
-import os, json, uuid, shutil, subprocess, zipfile
+import os, json, time, uuid, shutil, subprocess, zipfile
 import gradio as gr
 from google import genai
 from google.genai import types
@@ -60,11 +60,39 @@ def fetch_transcript_safe(vid_id):
         except Exception:
             return []
 
-def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_sec=None, scan_hours=3):
+def call_gemini_with_fallback(client, contents, config):
+    # अगर एक मॉडल पर 503 (High Demand) आए तो अपने आप दूसरे मॉडल पर स्विच करेगा
+    models_to_try = [
+        "gemini-3.8-flash",
+        "gemini-3.8-flash-lite",
+        "gemini-flash-latest"
+    ]
+    last_err = None
+    for model_name in models_to_try:
+        for attempt in range(2):
+            try:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config
+                )
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                    time.sleep(2)
+                    continue
+                elif "404" in err_str or "NOT_FOUND" in err_str:
+                    break
+                else:
+                    raise e
+    raise last_err
+
+def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_sec=None, scan_hours=1):
     client = genai.Client(api_key=api_key.strip())
     limit_note = f"All start_sec values MUST be less than {int(max_sec)} seconds." if max_sec else ""
 
-    # तरीका 1: अगर ट्रांसक्रिप्ट उपलब्ध है तो तेज़ टेक्स्ट विश्लेषण
+    # तरीका 1: तेज़ टेक्स्ट विश्लेषण (अगर YouTube CC उपलब्ध हैं)
     if transcript_list:
         condensed = []
         valid_items = [t for t in transcript_list if (max_sec is None or t['start'] < max_sec)]
@@ -83,16 +111,16 @@ def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_se
             Transcript:
             {transcript_text}
             """
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json")
+            response = call_gemini_with_fallback(
+                client,
+                prompt,
+                types.GenerateContentConfig(response_mime_type="application/json")
             )
             return json.loads(response.text.strip())[:int(num_clips)]
 
-    # तरीका 2 (Multimodal Low-Res Chunked Video): बिना CC के बड़े वीडियो/स्ट्रीम को हिस्सों में स्कैन करना
+    # तरीका 2: 20-20 मिनट के हल्के Micro-Chunks में डायरेक्ट वीडियो स्कैन (ताकि 503 ओवरलोड न हो)
     clean_url = clean_youtube_url(youtube_url)
-    chunk_sec = 7200  # एक बार में 2 घंटे (Low resolution में आसानी से 1M tokens के अंदर आता है)
+    chunk_sec = 1200  # 20 मिनट प्रति रिक्वेस्ट (सर्वर लोड कम रखने के लिए)
     total_scan_sec = int(scan_hours * 3600)
     if max_sec:
         total_scan_sec = min(total_scan_sec, int(max_sec))
@@ -115,16 +143,16 @@ def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_se
         Return ONLY a JSON array of objects with exact keys: "start_sec" (integer), "reason" (short reason), "title" (catchy Short title with hashtags), "caption" (engaging description with hashtags).
         """
         try:
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=[
+            response = call_gemini_with_fallback(
+                client,
+                [
                     types.Part(
                         file_data=types.FileData(file_uri=clean_url, mime_type="video/*"),
                         video_metadata=types.VideoMetadata(start_offset=f"{c_start}s", end_offset=f"{c_end}s")
                     ),
                     prompt
                 ],
-                config=types.GenerateContentConfig(
+                types.GenerateContentConfig(
                     response_mime_type="application/json",
                     media_resolution="MEDIA_RESOLUTION_LOW"
                 )
@@ -132,7 +160,7 @@ def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_se
             chunk_moments = json.loads(response.text.strip())
             all_moments.extend(chunk_moments)
         except Exception as e:
-            if c_idx == 0:
+            if c_idx == 0 and not all_moments:
                 raise e
             break
 
@@ -147,7 +175,7 @@ def find_stream_timestamps(youtube_url, api_key, num_clips, scan_hours):
 
     try:
         transcript_list = fetch_transcript_safe(vid_id)
-        mode_used = "Transcript + AI" if transcript_list else f"Direct Gemini Multimodal AI (0 से {int(scan_hours)} घंटे स्कैन)"
+        mode_used = "Transcript + AI" if transcript_list else f"Direct Gemini Multimodal AI (0 से {int(scan_hours)} घंटे, 20-मिनट चंक्स)"
         moments = analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, scan_hours=scan_hours)
 
         if not moments:
@@ -165,7 +193,11 @@ def find_stream_timestamps(youtube_url, api_key, num_clips, scan_hours):
             )
         return "\n".join(lines)
     except Exception as e:
-        return f"❌ AI विश्लेषण एरर डिटेल:\n{str(e)}"
+        err_msg = str(e)
+        extra_tip = ""
+        if "503" in err_msg or "UNAVAILABLE" in err_msg:
+            extra_tip = "\n\n💡 सुझाव: अगर यह वीडियो अभी Live चल रहा है या कुछ ही देर पहले खत्म हुआ है, तो YouTube की प्रोसेसिंग पूरी होने तक Gemini इसे नहीं पढ़ पाता। किसी 1-2 दिन पुराने पब्लिक वीडियो लिंक पर टेस्ट करें!"
+        return f"❌ AI विश्लेषण एरर डिटेल:\n{err_msg}{extra_tip}"
 
 def generate_clips(video_file, youtube_url, api_key, facecam_pos, cam_tightness, num_clips):
     if video_file is None:
@@ -307,17 +339,17 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Auclipto.ai 2.0") as demo:
             )
 
         with gr.Tab("🔍 2. 12-Hour Stream Timestamp Finder (बिना डाउनलोड)"):
-            gr.Markdown("### किसी भी YouTube वीडियो या 12-15 घंटे की लाइव स्ट्रीम का लिंक डालें — AI हिस्सों में स्कैन करके टॉप वायरल टाइमस्टैम्प बता देगा!")
+            gr.Markdown("### किसी भी पब्लिक YouTube वीडियो या पुरानी लाइव स्ट्रीम का लिंक डालें — AI 20-20 मिनट के चंक्स में स्कैन करके वायरल टाइमस्टैम्प बता देगा!")
             with gr.Row():
                 ts_url_in = gr.Textbox(label="🔗 YouTube Live Stream / Video लिंक")
                 ts_key_in = gr.Textbox(label="🔑 Gemini API Key", type="password")
             with gr.Row():
                 ts_num_in = gr.Slider(3, 15, value=10, step=1, label="🎯 कितने वायरल टाइमस्टैम्प चाहिए?")
-                ts_hours_in = gr.Slider(1, 15, value=4, step=1, label="⏱️ स्ट्रीम के शुरुआती कितने घंटे स्कैन करें?")
+                ts_hours_in = gr.Slider(1, 15, value=1, step=1, label="⏱️ स्ट्रीम के शुरुआती कितने घंटे स्कैन करें?")
             ts_btn = gr.Button("🔍 वायरल टाइमस्टैम्प ढूँढें", variant="primary")
             ts_out = gr.Textbox(label="📋 टॉप वायरल टाइमस्टैम्प लिस्ट (घंटा:मिनट:सेकंड)", lines=16)
 
             ts_btn.click(find_stream_timestamps, inputs=[ts_url_in, ts_key_in, ts_num_in, ts_hours_in], outputs=[ts_out])
 
 demo.launch(server_name="0.0.0.0", server_port=7860)
-    
+        
