@@ -1,6 +1,7 @@
-import os, json, subprocess, zipfile
+import os, json, uuid, shutil, subprocess, zipfile
 import gradio as gr
 from google import genai
+from google.genai import types
 from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import urlparse, parse_qs
 
@@ -17,9 +18,18 @@ def get_video_id(url):
             return parsed.path.split('/')[2]
     return None
 
+def sec_to_hms(sec):
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
 def get_video_duration(video_path):
-    cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{video_path}"'
-    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", video_path
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
     try:
         return float(res.stdout.strip())
     except Exception:
@@ -44,15 +54,81 @@ def fetch_transcript_safe(vid_id):
         except Exception:
             return []
 
-def generate_clips(video_file, youtube_url, api_key, facecam_pos, num_clips):
-    if video_file is None:
-        return "❌ कृपया पहले अपने फोन से डाउनलोड की गई वीडियो फ़ाइल (MP4) अपलोड करें।", None, ""
-    if not api_key:
-        return "❌ कृपया अपनी Gemini API Key डालें।", None, ""
+def analyze_with_gemini(transcript_list, api_key, num_clips, max_sec=None):
+    condensed = []
+    valid_items = [t for t in transcript_list if (max_sec is None or t['start'] < max_sec)]
+    if not valid_items:
+        return []
+    step = max(1, len(valid_items) // 450)
+    for i in range(0, len(valid_items), step):
+        item = valid_items[i]
+        condensed.append(f"[{int(item['start'])}s] {item['text']}")
+    transcript_text = "\n".join(condensed[:450])
 
-    os.makedirs("outputs", exist_ok=True)
-    for f in os.listdir("outputs"):
-        os.remove(os.path.join("outputs", f))
+    client = genai.Client(api_key=api_key.strip())
+    prompt = f"""
+    Analyze this gaming/creator video transcript and find the top {int(num_clips)} funniest, high-energy, shocking, or viral moments suitable for 35-second YouTube Shorts.
+    Convert any Hindi dialogue into clean Romanized Hinglish or English for titles and captions.
+    Return ONLY a JSON array of objects with keys: "start_sec" (integer), "reason" (short reason why it is viral), "title" (catchy Short title with hashtags), "caption" (engaging description with hashtags).
+    Transcript:
+    {transcript_text}
+    """
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json")
+    )
+    moments = json.loads(response.text.strip())
+    return moments[:int(num_clips)]
+
+# TAB 1 FUNCTION: 12-Hour Stream AI Timestamp Finder (बिना वीडियो डाउनलोड किए)
+def find_stream_timestamps(youtube_url, api_key, num_clips):
+    if not youtube_url or not api_key:
+        return "❌ कृपया YouTube वीडियो/लाइव स्ट्रीम लिंक और अपनी Gemini API Key दोनों डालें।"
+    vid_id = get_video_id(youtube_url)
+    if not vid_id:
+        return "❌ सही YouTube लिंक डालें।"
+
+    transcript_list = fetch_transcript_safe(vid_id)
+    if not transcript_list:
+        return "❌ इस वीडियो में CC/Subtitles उपलब्ध नहीं हैं (या लाइव स्ट्रीम अभी प्रोसेस हो रही है)।"
+
+    try:
+        moments = analyze_with_gemini(transcript_list, api_key, num_clips)
+        if not moments:
+            return "❌ AI कोई वायरल मोमेंट नहीं निकाल पाया।"
+
+        lines = [f"✅ कुल {len(moments)} वायरल टाइमस्टैम्प मिले (बिना वीडियो डाउनलोड किए):\n"]
+        for idx, m in enumerate(moments, 1):
+            start_s = int(m.get("start_sec", 0))
+            end_s = start_s + 45
+            lines.append(
+                f"🔥 CLIP {idx}: {sec_to_hms(start_s)} से {sec_to_hms(end_s)} तक (Start: {start_s}s)\n"
+                f"💡 वजह: {m.get('reason', 'High energy moment')}\n"
+                f"🎬 Title: {m.get('title', '')}\n"
+                f"{'-'*40}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Gemini AI एरर: {str(e)}"
+
+# TAB 2 FUNCTION: Auto Video Clipper + In-App Preview + Tight Facecam
+def generate_clips(video_file, youtube_url, api_key, facecam_pos, cam_tightness, num_clips):
+    if video_file is None:
+        return "❌ कृपया पहले अपने फोन से MP4 वीडियो फ़ाइल अपलोड करें।", [], None, ""
+    if not api_key:
+        return "❌ कृपया अपनी Gemini API Key डालें।", [], None, ""
+
+    # पुराना कचरा साफ़ करना ताकि 512MB RAM/Disk कभी न भरे
+    os.makedirs("jobs", exist_ok=True)
+    for old_job in os.listdir("jobs"):
+        old_path = os.path.join("jobs", old_job)
+        if os.path.isdir(old_path):
+            shutil.rmtree(old_path, ignore_errors=True)
+
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = os.path.join("jobs", job_id)
+    os.makedirs(job_dir, exist_ok=True)
 
     input_path = video_file.name if hasattr(video_file, 'name') else video_file
     total_dur = get_video_duration(input_path)
@@ -60,56 +136,39 @@ def generate_clips(video_file, youtube_url, api_key, facecam_pos, num_clips):
     transcript_list = fetch_transcript_safe(vid_id)
     moments = []
 
-    # 1. अगर YouTube लिंक भी दिया है तो Gemini AI से वायरल मोमेंट्स ढूँढना
     if transcript_list:
         try:
-            condensed = []
-            step = max(1, len(transcript_list) // 350)
-            for i in range(0, len(transcript_list), step):
-                item = transcript_list[i]
-                if item['start'] < (total_dur - 45):
-                    condensed.append(f"[{int(item['start'])}s] {item['text']}")
-            transcript_text = "\n".join(condensed[:350])
-
-            client = genai.Client(api_key=api_key.strip())
-            prompt = f"""
-            Analyze this gaming stream transcript and find the top {int(num_clips)} funniest, high-energy, or viral moments suitable for 35-second YouTube Shorts.
-            Return ONLY a valid JSON array with exact format:
-            [
-              {{"start_sec": 120, "title": "Catchy Short Title #GTA6 #Shorts", "caption": "Viral description with hashtags"}}
-            ]
-            Transcript:
-            {transcript_text}
-            """
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-            )
-            raw_json = response.text.strip().replace("```json", "").replace("```", "").strip()
-            moments = json.loads(raw_json)[:int(num_clips)]
+            moments = analyze_with_gemini(transcript_list, api_key, num_clips, max_sec=(total_dur - 40))
         except Exception:
             moments = []
 
-    # 2. अगर लिंक नहीं दिया या CC नहीं है, तो पूरी वीडियो में से बराबर दूरी पर बेस्ट हिस्से चुनना
     if not moments:
-        usable_dur = max(40.0, total_dur - 45.0)
+        usable_dur = max(40.0, total_dur - 40.0)
         gap = usable_dur / (int(num_clips) + 1)
         for i in range(int(num_clips)):
-            start_t = int(gap * (i + 1))
             moments.append({
-                "start_sec": start_t,
+                "start_sec": int(gap * (i + 1)),
                 "title": f"GTA Epic Gameplay Moment #{i+1} 🔥 #GTA6 #Shorts",
-                "caption": f"Crazy GTA Gaming Highlight #{i+1}! 😱🎮\n\n#GTA6 #GTAVI #GamingShorts #YouTubeShorts #Viral"
+                "caption": f"Crazy Gaming Highlight #{i+1}! 😱🎮\n\n#GTA6 #GTAVI #GamingShorts #Shorts #Viral"
             })
 
-    # Facecam और Gameplay को 720x1280 (9:16 HD) में सेट करना (ताकि 512MB RAM पर कभी क्रैश न हो)
-    crop_map = {
-        "top-left": "crop=iw*0.28:ih*0.33:0:0",
-        "top-right": "crop=iw*0.28:ih*0.33:iw*0.72:0",
-        "bottom-left": "crop=iw*0.28:ih*0.33:0:ih*0.67",
-        "bottom-right": "crop=iw*0.28:ih*0.33:iw*0.72:ih*0.67"
-    }
-    cam_crop = crop_map.get(facecam_pos, "crop=iw*0.28:ih*0.33:0:ih*0.67")
+    # Tight vs Normal Facecam क्रॉप (ताकि साइड का बैकग्राउंड न दिखे)
+    if cam_tightness == "Tight (सिर्फ़ चेहरा/वेबकैम बॉक्स)":
+        crop_map = {
+            "top-left": "crop=iw*0.21:ih*0.27:0:0",
+            "top-right": "crop=iw*0.21:ih*0.27:iw*0.79:0",
+            "bottom-left": "crop=iw*0.21:ih*0.27:0:ih*0.62",
+            "bottom-right": "crop=iw*0.21:ih*0.27:iw*0.79:ih*0.62"
+        }
+    else:
+        crop_map = {
+            "top-left": "crop=iw*0.28:ih*0.33:0:0",
+            "top-right": "crop=iw*0.28:ih*0.33:iw*0.72:0",
+            "bottom-left": "crop=iw*0.28:ih*0.33:0:ih*0.67",
+            "bottom-right": "crop=iw*0.28:ih*0.33:iw*0.72:ih*0.67"
+        }
+
+    cam_crop = crop_map.get(facecam_pos, "crop=iw*0.21:ih*0.27:0:ih*0.62")
 
     generated_files = []
     all_captions = []
@@ -117,8 +176,8 @@ def generate_clips(video_file, youtube_url, api_key, facecam_pos, num_clips):
 
     for idx, m in enumerate(moments, 1):
         start_s = min(int(m.get("start_sec", 0)), max(0, int(total_dur - 36)))
-        final_vid = f"outputs/Auclipto_Short_{idx}.mp4"
-        srt_file = f"outputs/sub_{idx}.srt"
+        final_vid = os.path.join(job_dir, f"Auclipto_Short_{idx}.mp4")
+        srt_file = os.path.join(job_dir, f"sub_{idx}.srt").replace("\\", "/")
 
         clip_subs = [t for t in transcript_list if start_s <= t['start'] <= (start_s + 35)]
         has_subs = len(clip_subs) > 0
@@ -135,7 +194,7 @@ def generate_clips(video_file, youtube_url, api_key, facecam_pos, num_clips):
                 f"[0:v]{cam_crop},scale=720:420[cam];"
                 f"[0:v]crop=ih*0.5625:ih:(iw-ih*0.5625)/2:0,scale=720:860[game];"
                 f"[cam][game]vstack=inputs=2[stacked];"
-                f"[stacked]subtitles={srt_file}:force_style='Fontname=Arial,FontSize=15,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=60'[out]"
+                f"[stacked]subtitles={srt_file}:force_style='Fontname=Arial,FontSize=16,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=60'[out]"
             )
         else:
             filter_complex = (
@@ -144,12 +203,13 @@ def generate_clips(video_file, youtube_url, api_key, facecam_pos, num_clips):
                 f"[cam][game]vstack=inputs=2[out]"
             )
 
-        ff_cmd = (
-            f'ffmpeg -y -ss {start_s} -t 35 -i "{input_path}" '
-            f'-filter_complex "{filter_complex}" -map "[out]" -map 0:a? '
-            f'-c:v libx264 -preset ultrafast -crf 25 -threads 1 -c:a aac -b:a 128k "{final_vid}"'
-        )
-        res = subprocess.run(ff_cmd, shell=True, capture_output=True, text=True)
+        ff_cmd = [
+            "ffmpeg", "-y", "-ss", str(start_s), "-t", "35", "-i", input_path,
+            "-filter_complex", filter_complex, "-map", "[out]", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-threads", "1",
+            "-c:a", "aac", "-b:a", "128k", final_vid
+        ]
+        res = subprocess.run(ff_cmd, capture_output=True, text=True)
         if res.returncode != 0:
             last_error = res.stderr[-300:]
 
@@ -158,29 +218,51 @@ def generate_clips(video_file, youtube_url, api_key, facecam_pos, num_clips):
             all_captions.append(f"=== CLIP {idx} ===\nTitle: {m.get('title')}\nCaption: {m.get('caption')}\n")
 
     if not generated_files:
-        return f"❌ वीडियो एडिटिंग एरर:\n{last_error}", None, ""
+        return f"❌ वीडियो एडिटिंग एरर:\n{last_error}", [], None, ""
 
-    zip_path = "outputs/Auclipto_All_Shorts.zip"
+    zip_path = os.path.join(job_dir, "Auclipto_All_Shorts.zip")
     with zipfile.ZipFile(zip_path, 'w') as zf:
         for file in generated_files:
             zf.write(file, os.path.basename(file))
 
-    return f"✅ बधाई हो भाई! कुल {len(generated_files)} वायरल Shorts (720p HD, बिना वॉटरमार्क) तैयार हैं!", zip_path, "\n".join(all_captions)
+    status_msg = f"✅ Step 01 सफल! कुल {len(generated_files)} वायरल Shorts तैयार हैं! नीचे सीधे चलाकर देखें या ZIP डाउनलोड करें।"
+    return status_msg, generated_files, zip_path, "\n".join(all_captions)
 
-with gr.Blocks(theme=gr.themes.Soft(), title="Auclipto.ai") as demo:
-    gr.Markdown("# 🎬 Auclipto.ai — AI Gaming Auto-Clipper (720p No Watermark)")
-    with gr.Row():
-        vid_in = gr.File(label="📁 1. अपने फोन से गेमिंग वीडियो अपलोड करें (MP4 - 720p)")
-        url_in = gr.Textbox(label="🔗 2. उसी वीडियो का YouTube लिंक (वैकल्पिक - AI Subtitles और वायरल सीन चुनने के लिए)")
-    with gr.Row():
-        key_in = gr.Textbox(label="🔑 3. Gemini API Key", type="password")
-        cam_in = gr.Dropdown(["bottom-left", "top-left", "top-right", "bottom-right"], value="bottom-left", label="🎥 Streamer Facecam कहाँ है?")
-        num_in = gr.Slider(1, 10, value=3, step=1, label="✂️ कितनी क्लिप्स चाहिए?")
-    btn = gr.Button("🚀 वायरल क्लिप्स जनरेट करें", variant="primary")
-    status_out = gr.Textbox(label="स्टेटस")
-    zip_out = gr.File(label="📥 सभी Shorts डाउनलोड करें (ZIP फ़ाइल - 720p)")
-    cap_out = gr.Textbox(label="📝 सभी क्लिप्स के YouTube Titles और Captions", lines=12)
+with gr.Blocks(theme=gr.themes.Soft(), title="Auclipto.ai 2.0") as demo:
+    gr.Markdown("# 🚀 Auclipto.ai 2.0 — AI Viral Shorts Studio")
 
-    btn.click(generate_clips, inputs=[vid_in, url_in, key_in, cam_in, num_in], outputs=[status_out, zip_out, cap_out])
+    with gr.Tabs():
+        with gr.Tab("✂️ 1. Auto Video Clipper (Shorts बनाएं)"):
+            with gr.Row():
+                vid_in = gr.File(label="📁 1. MP4 वीडियो अपलोड करें", file_types=[".mp4", ".mkv", ".mov"])
+                url_in = gr.Textbox(label="🔗 2. उसी वीडियो का YouTube लिंक (वैकल्पिक - AI Subtitles और वायरल सीन के लिए)")
+            with gr.Row():
+                key_in = gr.Textbox(label="🔑 3. Gemini API Key", type="password")
+                cam_in = gr.Dropdown(["bottom-left", "top-left", "top-right", "bottom-right"], value="bottom-left", label="🎥 Streamer Facecam कहाँ है?")
+                tight_in = gr.Dropdown(["Tight (सिर्फ़ चेहरा/वेबकैम बॉक्स)", "Normal (बड़ा बॉक्स)"], value="Tight (सिर्फ़ चेहरा/वेबकैम बॉक्स)", label="📐 Facecam ज़ूम")
+                num_in = gr.Slider(1, 10, value=2, step=1, label="✂️ कितनी क्लिप्स चाहिए?")
+
+            btn = gr.Button("🚀 वायरल क्लिप्स जनरेट करें", variant="primary")
+            status_out = gr.Textbox(label="स्टेटस")
+            preview_out = gr.Gallery(label="🎬 इन-ऐप वीडियो प्रिव्यू (यहीं चलाकर देखें)", columns=2, height="auto")
+            zip_out = gr.File(label="📥 सभी Shorts एक साथ डाउनलोड करें (ZIP फ़ाइल)")
+            cap_out = gr.Textbox(label="📝 YouTube Titles और Captions", lines=10)
+
+            btn.click(
+                generate_clips,
+                inputs=[vid_in, url_in, key_in, cam_in, tight_in, num_in],
+                outputs=[status_out, preview_out, zip_out, cap_out]
+            )
+
+        with gr.Tab("🔍 2. 12-Hour Stream Timestamp Finder (बिना डाउनलोड)"):
+            gr.Markdown("### 10-15 घंटे की लंबी स्ट्रीम का लिंक डालें — AI 5 सेकंड में टॉप वायरल टाइमस्टैम्प बता देगा!")
+            with gr.Row():
+                ts_url_in = gr.Textbox(label="🔗 YouTube Live Stream / Video लिंक")
+                ts_key_in = gr.Textbox(label="🔑 Gemini API Key", type="password")
+                ts_num_in = gr.Slider(3, 15, value=10, step=1, label="🎯 कितने वायरल टाइमस्टैम्प चाहिए?")
+            ts_btn = gr.Button("🔍 वायरल टाइमस्टैम्प ढूँढें", variant="primary")
+            ts_out = gr.Textbox(label="📋 टॉप वायरल टाइमस्टैम्प लिस्ट (घंटा:मिनट:सेकंड)", lines=16)
+
+            ts_btn.click(find_stream_timestamps, inputs=[ts_url_in, ts_key_in, ts_num_in], outputs=[ts_out])
 
 demo.launch(server_name="0.0.0.0", server_port=7860)
