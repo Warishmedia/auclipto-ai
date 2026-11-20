@@ -64,7 +64,6 @@ def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_se
     client = genai.Client(api_key=api_key.strip())
     limit_note = f"All start_sec values MUST be less than {int(max_sec)} seconds." if max_sec else ""
 
-    # तरीका 1: अगर ट्रांसक्रिप्ट उपलब्ध है तो तेज़ टेक्स्ट विश्लेषण
     if transcript_list:
         condensed = []
         valid_items = [t for t in transcript_list if (max_sec is None or t['start'] < max_sec)]
@@ -84,13 +83,12 @@ def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_se
             {transcript_text}
             """
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.8-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
             return json.loads(response.text.strip())[:int(num_clips)]
 
-    # तरीका 2 (Multimodal Direct Video): बिना CC/Subtitles के सीधा YouTube वीडियो सुनकर-देखकर मोमेंट्स निकालना
     clean_url = clean_youtube_url(youtube_url)
     prompt = f"""
     Watch and listen to this YouTube video carefully and find the top {int(num_clips)} funniest, high-energy, shocking, or viral moments suitable for 35-second YouTube Shorts.
@@ -99,7 +97,7 @@ def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_se
     Return ONLY a JSON array of objects with exact keys: "start_sec" (integer seconds from start of video), "reason" (short reason why it is viral), "title" (catchy Short title with hashtags), "caption" (engaging description with hashtags).
     """
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=[
             types.Part.from_uri(file_uri=clean_url, mime_type="video/*"),
             prompt
@@ -108,7 +106,6 @@ def analyze_with_gemini(youtube_url, transcript_list, api_key, num_clips, max_se
     )
     return json.loads(response.text.strip())[:int(num_clips)]
 
-# TAB 1 FUNCTION: 12-Hour Stream AI Timestamp Finder (बिना डाउनलोड + बिना CC के भी काम करेगा)
 def find_stream_timestamps(youtube_url, api_key, num_clips):
     if not youtube_url or not api_key:
         return "❌ कृपया YouTube वीडियो/लाइव स्ट्रीम लिंक और अपनी Gemini API Key दोनों डालें।"
@@ -138,7 +135,6 @@ def find_stream_timestamps(youtube_url, api_key, num_clips):
     except Exception as e:
         return f"❌ AI विश्लेषण एरर डिटेल:\n{str(e)}"
 
-# TAB 2 FUNCTION: Auto Video Clipper + In-App Preview + Tight Facecam
 def generate_clips(video_file, youtube_url, api_key, facecam_pos, cam_tightness, num_clips):
     if video_file is None:
         return "❌ कृपया पहले अपने फोन से MP4 वीडियो फ़ाइल अपलोड करें।", [], None, ""
@@ -290,4 +286,3 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Auclipto.ai 2.0") as demo:
             ts_btn.click(find_stream_timestamps, inputs=[ts_url_in, ts_key_in, ts_num_in], outputs=[ts_out])
 
 demo.launch(server_name="0.0.0.0", server_port=7860)
-            
